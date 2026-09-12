@@ -14,6 +14,7 @@ import json
 import os
 import platform
 import sys
+import threading
 import time
 from pathlib import Path
 
@@ -96,15 +97,21 @@ def group_of(name: str) -> str:
 def parameter_rows(model) -> list[dict]:
     """Все тензоры параметров модели.
 
-    remove_duplicate=False — иначе в таблицу не попадёт lm_head.
+    remove_duplicate=False — иначе в таблицу не попадёт lm_head. Тензоры,
+    разделяющие хранилище (tie_word_embeddings), помечаются tied: их
+    считает сосед, и в сводную сумму они не должны попадать дважды.
     """
     rows = []
+    seen: set[int] = set()
     for name, param in model.named_parameters(remove_duplicate=False):
+        ptr = param.data_ptr()
+        tied = ptr in seen
+        seen.add(ptr)
         rows.append({
             "name": name,
             "shape": tuple(param.shape),
             "numel": param.numel(),
-            "tied": False,
+            "tied": tied,
         })
     return rows
 
@@ -156,8 +163,8 @@ def hook_targets(model) -> dict[str, int]:
     return {"первый": 0, "средний": n_layers // 2, "последний": n_layers - 1}
 
 
-def forward_hooks(modules: dict) -> dict:
-    """Навесить forward-hooks на модули и вернуть словарь, куда они пишут."""
+def forward_hooks(modules: dict) -> tuple[dict, list]:
+    """Навесить forward-hooks и вернуть словарь + handle'ы для их снятия."""
     store: dict[str, list[float]] = {}
 
     def make_hook(label: str):
@@ -166,9 +173,9 @@ def forward_hooks(modules: dict) -> dict:
             store[label] = hidden[0].float().norm(dim=-1).detach().cpu().tolist()
         return hook
 
-    for label, module in modules.items():
-        module.register_forward_hook(make_hook(label))
-    return store
+    handles = [module.register_forward_hook(make_hook(label))
+               for label, module in modules.items()]
+    return store, handles
 
 
 def activation_norms(tokenizer, model, params: dict) -> dict:
@@ -178,9 +185,13 @@ def activation_norms(tokenizer, model, params: dict) -> dict:
     prompt = build_prompt(tokenizer, params, params["hooks"]["prompt"])
     inputs = tokenizer(prompt, return_tensors="pt").to(model.device)
 
-    store = forward_hooks({label: layers[i] for label, i in targets.items()})
-    with torch.inference_mode():
-        model(**inputs)
+    store, handles = forward_hooks({label: layers[i] for label, i in targets.items()})
+    try:
+        with torch.inference_mode():
+            model(**inputs)
+    finally:
+        for handle in handles:
+            handle.remove()
 
     return {
         "layers": targets,
@@ -253,15 +264,38 @@ def lora_report(model, params: dict) -> list[dict]:
 # --------------------------------------------------------------------------
 
 def device_allocated_bytes(device: torch.device) -> int:
-    """Сколько памяти занято прямо сейчас."""
-    used, _ = peak_rss()
-    return used
+    """Сколько памяти занято на устройстве прямо сейчас.
+
+    На cuda/mps тензоры лежат в памяти ускорителя и в RSS процесса почти не
+    видны, поэтому мерить надо память самого устройства. На cpu тензоры живут
+    в RAM процесса — мерим текущий RSS (не high-water mark: тот копит пики
+    прошлых прогонов).
+    """
+    if device.type == "cuda":
+        return torch.cuda.memory_allocated(device)
+    if device.type == "mps":
+        return torch.mps.current_allocated_memory()
+    if psutil is not None:
+        return int(psutil.Process().memory_info().rss)
+    if resource is not None:
+        peak = resource.getrusage(resource.RUSAGE_SELF).ru_maxrss
+        return peak if sys.platform == "darwin" else peak * 1024
+    raise RuntimeError(
+        f"нечем снять память на платформе {sys.platform}: ни psutil, ни resource"
+    )
 
 
 def device_metric_source(device: torch.device) -> str:
-    """Имя функции, которой снята память."""
-    _, source = peak_rss()
-    return source
+    """Имя функции, которой снята память устройства."""
+    if device.type == "cuda":
+        return "torch.cuda.max_memory_allocated"
+    if device.type == "mps":
+        return "torch.mps.current_allocated_memory"
+    if psutil is not None:
+        return "peak_wset"
+    if resource is not None:
+        return "ru_maxrss"
+    return "unknown"
 
 
 def peak_rss() -> tuple[int, str]:
@@ -294,20 +328,42 @@ def peak_rss() -> tuple[int, str]:
 
 
 class PeakMemory:
-    """Сколько памяти занято к концу прогона."""
+    """Пик памяти за время жизни контекста, а не снимок после gc.collect().
+
+    На cuda есть штатный high-water mark: сбрасываем его в __enter__ и читаем
+    max_memory_allocated в __exit__. На mps и cpu штатного пика нет, поэтому
+    семплируем текущую память фоновым потоком с шагом interval и берём максимум.
+    """
 
     def __init__(self, device: torch.device, interval: float = 0.01):
         self.device = device
-        self.used = 0
+        self.interval = interval
+        self.peak = 0
+        self._stop = False
+        self._thread: threading.Thread | None = None
+
+    def _sample(self) -> None:
+        while not self._stop:
+            current = device_allocated_bytes(self.device)
+            if current > self.peak:
+                self.peak = current
+            time.sleep(self.interval)
 
     def __enter__(self) -> "PeakMemory":
+        self.peak = 0
+        if self.device.type == "cuda":
+            torch.cuda.reset_peak_memory_stats(self.device)
+        self._stop = False
+        self._thread = threading.Thread(target=self._sample, daemon=True)
+        self._thread.start()
         return self
 
     def __exit__(self, *exc) -> bool:
-        # TODO: это расход режима — или то, что осталось занято после него,
-        # когда всё уже посчитано и мусор собран?
-        gc.collect()
-        self.used = device_allocated_bytes(self.device)
+        self._stop = True
+        if self._thread is not None:
+            self._thread.join()
+        if self.device.type == "cuda":
+            self.peak = max(self.peak, torch.cuda.max_memory_allocated(self.device))
         return False
 
     def result(self) -> dict:
@@ -315,13 +371,12 @@ class PeakMemory:
         rss, rss_source = peak_rss()
         accelerator = self.device.type in ("mps", "cuda")
         return {
-            "peak_mb": round((self.used if accelerator else rss) / 1024 ** 2, 1),
-            "peak_device_mb": round(self.used / 1024 ** 2, 1),
-            "peak_rss_mb": round(rss / 1024 ** 2, 1),
+            "peak_mb": round(self.peak / 1024 ** 2, 1),
+            "peak_device_mb": round(self.peak / 1024 ** 2, 1),
+            "peak_rss_mb": round((self.peak if not accelerator else rss) / 1024 ** 2, 1),
             "metric": (f"аллокатор {self.device.type}" if accelerator
                        else "RSS процесса"),
-            "metric_source": (device_metric_source(self.device) if accelerator
-                              else rss_source),
+            "metric_source": device_metric_source(self.device),
             "rss_source": rss_source,
         }
 
@@ -440,7 +495,7 @@ def main() -> None:
     params["model"]["device"] = str(resolve_device(params))
 
     if args.probe:
-        print(json.dumps(measure_mode(args.probe, params), ensure_ascii=False))
+        print(json.dumps(measure_mode(args.probe, params), ensure_ascii=True))
         return
 
     # Импорт здесь, а не наверху: matplotlib не нужен в служебных --probe

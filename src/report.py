@@ -189,12 +189,13 @@ def memory_section(report: dict) -> list[str]:
             f"{item['peak_mb'] / base['peak_mb']:.2f} | {item['seconds']:.1f} | {loss} |"
         )
 
-    weights_mb = report["params_total"] * 2 / 1024 ** 2
+    bytes_per_param = 4 if report["dtype"] in ("float32", "float") else 2
+    weights_mb = report["params_total"] * bytes_per_param / 1024 ** 2
     rss_values = [item["peak_rss_mb"] for item in modes.values()]
     rss_spread = max(rss_values) - min(rss_values)
     lines += [
         "",
-        f"Прикидка из лекции: веса bf16 — {weights_mb:.0f} МБ. Full fine-tune добавляет",
+        f"Прикидка из лекции: веса {report['dtype']} — {weights_mb:.0f} МБ. Full fine-tune добавляет",
         f"градиенты (+{weights_mb:.0f} МБ) и два состояния AdamW (+{2 * weights_mb:.0f} МБ),",
         "то есть ×4 к весам ещё до активаций — что и видно в замере.",
         f"LoRA обучает {thousands(report['lora'][0]['peft'])} параметров вместо "
